@@ -1,0 +1,125 @@
+FORGE - Gerenciador de Pacotes Minimalista
+========================================
+
+1. Introdução
+-------------
+O **Forge** é um gerenciador de pacotes minimalista inspirado no KISS Linux.
+Todo o sistema é construído em shell script puro, com foco em simplicidade,
+transparência e auditabilidade. Não há banco de dados binário, apenas diretórios
+e arquivos de texto em /var/db/forge/installed.
+
+2. Estrutura de Diretórios
+--------------------------
+Repositórios de pacotes (normalmente versionados em Git):
+/repo/
+  base/
+    gcc/
+      build       # Script de compilação
+      depends     # Lista de dependências
+      sources     # URLs ou caminhos de fontes
+      version     # Versão do pacote
+      patches/    # Patches opcionais
+  extras/
+  desktop/
+  x11/
+
+Banco de dados local dos pacotes instalados:
+/var/db/forge/installed/<pacote>/
+  version    # Versão instalada
+  manifest   # Lista de arquivos instalados
+  depends    # Dependências registradas
+
+Diretório de compilação temporário:
+/var/tmp/forge/build/
+
+Diretório para cache de fontes:
+/var/cache/forge/sources/
+
+Diretório para pacotes binários (.tar.xz):
+/var/cache/forge/packages/
+
+3. Configuração (.profile)
+--------------------------
+As variáveis principais são definidas em ~/.profile (ou /etc/profile):
+
+export FORGE_REPO="$HOME/repo"
+export FORGE_DB="/var/db/forge/installed"
+export FORGE_BUILD="/var/tmp/forge/build"
+export FORGE_CACHE="/var/cache/forge/sources"
+export FORGE_PKG="/var/cache/forge/packages"
+export FORGE_COLOR=1
+
+Após editar, rode:
+$ source ~/.profile
+
+4. Comandos do Forge
+--------------------
+$ forge build <pkg>     # Compila um pacote e gera um tar.xz
+$ forge install <pkg>   # Instala o pacote no sistema
+$ forge remove <pkg>    # Remove o pacote
+$ forge update          # Recompila todos os pacotes instalados
+$ forge orphans         # Lista pacotes órfãos
+$ forge show <pkg>      # Mostra detalhes do pacote
+$ forge search <name>   # Busca pacotes no repositório
+
+5. Funcionamento Interno
+-------------------------
+- O "forge build" resolve as dependências lendo o arquivo "depends".
+- Baixa os tarballs definidos em "sources".
+- Extrai, aplica patches (se houver), executa o script "build".
+- Instala em $DESTDIR, gera um tar.xz, guarda em /var/cache/forge/packages.
+- O "forge install" apenas extrai o tarball para / e registra em /var/db/forge/installed.
+- O "forge remove" lê o manifesto e apaga todos os arquivos listados.
+- O "forge orphans" mostra pacotes que não são dependência de ninguém.
+
+6. Exemplo de Pacote: GCC
+-------------------------
+Diretório: $FORGE_REPO/base/gcc/
+
+sources:
+http://ftp.gnu.org/gnu/gcc/gcc-12.2.0/gcc-12.2.0.tar.xz
+
+version:
+12.2.0
+
+depends:
+binutils
+glibc
+zlib
+
+build (com shebang):
+#!/bin/sh
+mkdir -p build
+cd build
+../configure \\
+  --prefix=/usr \\
+  --enable-languages=c,c++ \\
+  --disable-multilib \\
+  --disable-bootstrap \\
+  --enable-checking=release
+make
+make DESTDIR=$DESTDIR install
+
+7. Instalação e Uso
+-------------------
+Clone seu repositório (exemplo):
+$ git clone https://seu.git.repo/forge-pkgs ~/repo
+
+Atualize variáveis no ~/.profile:
+export FORGE_REPO="$HOME/repo"
+
+Inicie o uso:
+$ forge build gcc
+$ forge install gcc
+$ forge show gcc
+$ forge orphans
+
+8. Logs
+-------
+Todos os logs ficam em /var/log/forge/<pkg>.log
+
+9. Resumo
+---------
+O Forge é simples, cada pacote é apenas um diretório com arquivos de receita.
+A instalação é transparente, audível e reproduzível. Ideal para sistemas
+minimalistas e inspirados no LFS.
