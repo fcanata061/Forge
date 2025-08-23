@@ -1,4 +1,225 @@
-FORGE - Gerenciador de Pacotes Minimalista
+====================================
+ MANUAL DO FORGE - Gerenciador de Pacotes Minimalista
+====================================
+
+1. INTRODUÇÃO
+-------------
+O Forge é um gerenciador de pacotes source-based, inspirado no KISS,
+minimalista porém completo.  
+Ele baixa o código-fonte, aplica patches, compila, instala e gerencia
+dependências recursivamente.  
+
+Recursos principais:
+- Dependências recursivas inteligentes
+- Hooks globais e por pacote (pre-build, post-install, etc.)
+- Logs detalhados por pacote
+- Suporte a múltiplos repositórios
+- Paralelismo configurável
+- Upgrade apenas para versões maiores
+- Remoção segura + opção de remover órfãos
+- Autocompletion para Bash e Zsh
+- Sincronização de repositórios via Git
+
+====================================
+2. ESTRUTURA DE DIRETÓRIOS
+------------------------------------
+~/.forge/
+ ├── db/         -> Banco de pacotes instalados
+ │    ├── <pkg>/files  -> Lista de arquivos instalados
+ │    ├── <pkg>/meta   -> Metadados do pacote
+ ├── log/        -> Logs detalhados (por pacote)
+ ├── src/        -> Fontes baixados
+ ├── build/      -> Diretório de build temporário
+ ├── hooks/      -> Hooks globais
+ │    ├── pre-build
+ │    ├── post-build
+ │    ├── pre-install
+ │    ├── post-install
+ │    ├── pre-remove
+ │    ├── post-remove
+
+Repositórios de pacotes (exemplo):
+$HOME/forge-repo/
+ ├── base/
+ │    └── gcc/
+ │         ├── build
+ │         ├── version
+ │         ├── source
+ │         ├── deps
+ │         └── patches/
+ ├── x11/
+ ├── desktop/
+ └── extras/
+
+====================================
+3. CONFIGURAÇÃO (.profile)
+------------------------------------
+Copie o conteúdo abaixo para ~/.profile e reinicie o shell.
+
+# ==============================
+# .profile do Forge
+# ==============================
+
+export FORGE_HOME="$HOME/.forge"
+
+# Repositórios locais
+export FORGE_REPOS=(
+    "$HOME/forge-repo/base"
+    "$HOME/forge-repo/x11"
+    "$HOME/forge-repo/desktop"
+    "$HOME/forge-repo/extras"
+)
+
+export FORGE_DB="$FORGE_HOME/db"
+export FORGE_LOG="$FORGE_HOME/log"
+export FORGE_SRC="$FORGE_HOME/src"
+export FORGE_BUILD="$FORGE_HOME/build"
+export FORGE_HOOKS="$FORGE_HOME/hooks"
+
+export FORGE_JOBS="$(nproc)"
+export FORGE_COLOR=1
+export FORGE_STRIP=1
+export FORGE_GIT_SYNC=1
+export FORGE_LOG_LEVEL=debug
+
+export FORGE_EDITOR="nano"
+export PATH="$HOME/bin:$PATH"
+
+# Autocompletion
+if [ -f /usr/share/bash-completion/bash_completion ]; then
+    . /usr/share/bash-completion/bash_completion
+fi
+
+_forge_complete() {
+    local cur prev cmds pkgs
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    cmds="build install remove upgrade world sync search show list orphans"
+
+    case "$prev" in
+        build|install|remove|upgrade|show)
+            pkgs=$(ls -1 "$FORGE_DB" 2>/dev/null)
+            COMPREPLY=( $(compgen -W "$pkgs" -- "$cur") )
+            return 0
+            ;;
+        orphans)
+            COMPREPLY=( $(compgen -W "list auto" -- "$cur") )
+            return 0
+            ;;
+    esac
+
+    COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
+    return 0
+}
+complete -F _forge_complete forge
+
+if type compdef &>/dev/null; then
+    _forge_zsh_complete() {
+        reply=($(build install remove upgrade world sync search show list orphans))
+    }
+    compdef _forge_zsh_complete forge
+fi
+
+====================================
+4. COMANDOS DO FORGE
+------------------------------------
+forge build <pkg>    -> Compila pacote (não instala)
+forge install <pkg>  -> Instala pacote no sistema
+forge remove <pkg>   -> Remove pacote (+ pergunta sobre órfãos)
+forge upgrade <pkg>  -> Atualiza se houver versão maior
+forge upgrade world  -> Atualiza todo o sistema
+forge show <pkg>     -> Mostra detalhes do pacote
+forge list           -> Lista pacotes instalados
+forge search <nome>  -> Busca em repositórios
+forge orphans list   -> Lista pacotes órfãos
+forge orphans auto   -> Remove órfãos automaticamente
+forge sync           -> Sincroniza repositórios git
+
+====================================
+5. HOOKS
+------------------------------------
+Hooks são scripts executados em momentos-chave:
+
+~/.forge/hooks/
+ ├── pre-build      -> executado antes de compilar
+ ├── post-build     -> executado após compilar
+ ├── pre-install    -> executado antes de instalar
+ ├── post-install   -> executado após instalar
+ ├── pre-remove     -> executado antes de remover
+ ├── post-remove    -> executado após remover
+
+Um hook recebe como argumento o nome do pacote.
+
+Exemplo: ~/.forge/hooks/post-install
+#!/bin/sh
+echo "[HOOK] Pacote $1 instalado em $(date)" >> ~/.forge/log/hooks.log
+
+====================================
+6. LOGS
+------------------------------------
+Cada pacote tem um log detalhado:
+~/.forge/log/<pkg>.log
+
+Contém saída do build, instalação, erros e mensagens de debug.
+
+====================================
+7. EXEMPLO DE RECIPE (GCC)
+------------------------------------
+$HOME/forge-repo/base/gcc/
+ ├── version   -> 13.2.0
+ ├── source    -> https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+ ├── deps      -> gmp mpfr mpc
+ ├── patches/  -> (arquivos .patch opcionais)
+ └── build     -> script de build
+
+Exemplo do arquivo build:
+
+#!/bin/sh
+set -e
+mkdir -p build
+cd build
+../configure \
+  --prefix=/usr \
+  --enable-languages=c,c++ \
+  --disable-multilib \
+  --disable-bootstrap \
+  --enable-checking=release
+make -j"$FORGE_JOBS"
+make DESTDIR="$DESTDIR" install
+
+====================================
+8. SINCRONIZAÇÃO (SYNC)
+------------------------------------
+Se os repositórios forem git, use:
+
+forge sync
+
+Isso roda `git pull` em todos os repositórios listados em $FORGE_REPOS.
+
+====================================
+9. AUTOCOMPLETION
+------------------------------------
+- Bash: já incluso no .profile
+- Zsh: já incluso no .profile
+
+Para ativar:
+$ source ~/.profile
+$ forge <TAB>
+
+====================================
+10. FLUXO DE USO
+------------------------------------
+1. Configure o .profile
+2. Crie os repositórios com pacotes
+3. Rode `forge build <pkg>`
+4. Rode `forge install <pkg>`
+5. Use `forge upgrade world` para atualizar o sistema
+6. Use `forge orphans list` e `forge orphans auto` para limpar
+
+====================================
+FIM DO MANUAL
+====================================FORGE - Gerenciador de Pacotes Minimalista
 ========================================
 
 1. Introdução
