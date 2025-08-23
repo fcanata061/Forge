@@ -1,517 +1,421 @@
 #!/bin/sh
-# forge — gerenciador de pacotes estilo KISS (minimalista, porém sólido)
+# forge - gerenciador de pacotes minimalista (evoluído)
 
-set -eu
+set -e
 
-# ========== Config (tudo pode ser sobrescrito via ambiente ou ~/.profile) ==========
-: "${FORGE_DB:=${HOME}/.local/forge}"                    # estado local (instalados, logs, cache)
-: "${FORGE_INSTALLED:=${FORGE_DB}/installed}"            # banco de instalados
-: "${FORGE_LOGS:=${FORGE_DB}/logs}"                      # logs detalhados por pacote
-: "${FORGE_SOURCES:=${FORGE_DB}/sources}"                # cache de tarballs/patches
-: "${FORGE_BUILD:=${FORGE_DB}/build}"                    # área de build (workdir + DESTDIR)
-: "${FORGE_BINPKGS:=${FORGE_DB}/binpkgs}"                # pacotes binários opcionais
-: "${FORGE_REPO_DIRS:=${HOME}/forge/repo}"               # lista ":"-separada de repositórios locais
-: "${FORGE_CLONE_BASE:=${HOME}/forge/repos}"             # onde clonar remotos (se usar na sync)
-: "${FORGE_JOBS:=$(command -v nproc >/dev/null 2>&1 && nproc || echo 1)}"
-: "${FORGE_COLOR:=1}"                                    # 1=on, 0=off
-: "${FORGE_QUIET:=0}"                                    # menos verboso no stdout (log vai p/ arquivo)
-: "${FORGE_SPINNER:=1}"                                  # 1=mostrar spinner em comandos longos
+# =========[ Core Variáveis - vêm do ~/.profile ]=========
+# FORGE_REPOS=("$HOME/forge-repo/base" "$HOME/forge-repo/extra")
+# FORGE_DB=/var/lib/forge
+# FORGE_LOG=/var/log/forge
+# FORGE_DESTDIR=/tmp/forge-dest
+# FORGE_JOBS=$(nproc)
 
-# cria estrutura
-mkdir -p "$FORGE_INSTALLED" "$FORGE_LOGS" "$FORGE_SOURCES" "$FORGE_BUILD" "$FORGE_BINPKGS" "$FORGE_CLONE_BASE"
+# =========[ Utils: Cores, Log, Spinner ]=========
+c_red="\033[1;31m"; c_grn="\033[1;32m"; c_yel="\033[1;33m"; c_cya="\033[1;36m"; c_rst="\033[0m"
 
-# ========== Cores/UX ==========
-if [ "$FORGE_COLOR" = "1" ] && [ -t 1 ]; then
-  C_BOLD="$(printf '\033[1m')" C_RED="$(printf '\033[31m')" C_GRN="$(printf '\033[32m')"
-  C_YLW="$(printf '\033[33m')" C_BLU="$(printf '\033[34m')" C_RST="$(printf '\033[0m')"
-else
-  C_BOLD=""; C_RED=""; C_GRN=""; C_YLW=""; C_BLU=""; C_RST=""
-fi
+msg() { printf "${c_cya}==>${c_rst} %s\n" "$*"; }
+ok()  { printf "${c_grn}✔${c_rst} %s\n" "$*"; }
+err() { printf "${c_red}✘${c_rst} %s\n" "$*" >&2; exit 1; }
+warn(){ printf "${c_yel}!${c_rst} %s\n" "$*\n"; }
 
-log_line() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "${FORGE_LOGS}/forge.log"; }
-say() { [ "${FORGE_QUIET}" = "1" ] || printf "${C_GRN}[forge]${C_RST} %s\n" "$*"; log_line "$*"; }
-warn() { printf "${C_YLW}[forge] WARN:${C_RST} %s\n" "$*" >&2; log_line "WARN: $*"; }
-die() { printf "${C_RED}[forge] ERRO:${C_RST} %s\n" "$*" >&2; log_line "ERRO: $*"; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || die "comando requerido não encontrado: $1"; }
+log() {
+    pkg=$1; shift
+    mkdir -p "$FORGE_LOG"
+    "$@" >"$FORGE_LOG/$pkg.log" 2>&1 || {
+        err "Falha ao executar comando. Veja $FORGE_LOG/$pkg.log"
+    }
+}
 
-# spinner leve
-spin_run() {
-  # uso: spin_run "Mensagem..." comando args...
-  local msg="$1"; shift
-  [ "$FORGE_SPINNER" = "1" ] && [ -t 1 ] && local sp='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-  [ "$FORGE_SPINNER" = "1" ] && [ -t 1 ] && printf "${C_BLU}%s${C_RST} " "$msg"
-  if [ "$FORGE_SPINNER" = "1" ] && [ -t 1 ]; then
-    ("$@" ) &
+spinner() {
     pid=$!
+    spin='-\|/'
     i=0
     while kill -0 $pid 2>/dev/null; do
-      i=$(((i+1)%10))
-      printf "\r${C_BLU}%s ${C_RST}%s" "$msg" "$(printf %s "$sp" | cut -c $i)"
-      sleep 0.1
+        i=$(( (i+1) %4 ))
+        printf "\r[%c] " "${spin:$i:1}"
+        sleep .1
     done
-    wait $pid
-    printf "\r${C_BLU}%s${C_RST} %s\n" "$msg" "${C_GRN}ok${C_RST}"
-  else
-    "$@"
-  fi
+    printf "\r   \r"
 }
 
-# ========== Repositórios ==========
-# FORGE_REPO_DIRS aceita múltiplos caminhos ":"-separados. (Somente diretórios locais nesta versão.)
-split_colon() { # imprime cada campo numa linha
-  echo "$1" | awk -F: '{for(i=1;i<=NF;i++) if($i!="") print $i}'
+# =========[ Funções de DB ]=========
+pkg_installed() { [ -f "$FORGE_DB/$1/version" ]; }
+
+pkg_version() {
+    [ -f "$FORGE_DB/$1/version" ] && cat "$FORGE_DB/$1/version"
 }
 
-recipe_dir() { # encontra diretório do pacote (primeiro que bater)
-  local pkg="$1" dir
-  while read -r dir; do
-    # categorias livres: base/pkg, extra/pkg, etc.
-    hit="$(find "$dir" -mindepth 2 -maxdepth 2 -type d -name "$pkg" 2>/dev/null | head -n1 || true)"
-    [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
-  done <<EOF
-$(split_colon "$FORGE_REPO_DIRS")
-EOF
-  return 1
+pkg_files() {
+    [ -f "$FORGE_DB/$1/files" ] && cat "$FORGE_DB/$1/files"
 }
 
-# ========== Metadados de pacote ==========
-pkg_version() { local d; d="$(recipe_dir "$1")" || return 1; tr -d ' \t\r\n' < "$d/version"; }
-pkg_deps()    { local d; d="$(recipe_dir "$1")" || return 0; awk 'NF{print $1}' "$d/depends" 2>/dev/null || true; }
+pkg_deps() {
+    [ -f "$FORGE_DB/$1/deps" ] && cat "$FORGE_DB/$1/deps"
+}
 
-# estado/paths
-pkg_state_dir() { echo "${FORGE_INSTALLED}/$1"; }
-pkg_files()     { echo "$(pkg_state_dir "$1")/files"; }
-pkg_installed_ver() { [ -f "$(pkg_state_dir "$1")/version" ] && cat "$(pkg_state_dir "$1")/version" || echo ""; }
-pkg_build_root(){ echo "${FORGE_BUILD}/$1"; }
-pkg_destdir()   { echo "${FORGE_BUILD}/$1/_dest"; }
-pkg_log()       { echo "${FORGE_LOGS}/$1.log"; }
-pkg_binpath()   { echo "${FORGE_BINPKGS}/$1-$(pkg_version "$1").tar.xz"; }
+record_install() {
+    pkg=$1; ver=$2; files=$3
+    mkdir -p "$FORGE_DB/$pkg"
+    echo "$ver" > "$FORGE_DB/$pkg/version"
+    cat "$files" > "$FORGE_DB/$pkg/files"
+    [ -f "deps" ] && cp deps "$FORGE_DB/$pkg/deps"
+}
 
-# ========== Resolução de dependências (DFS + ordem topológica) ==========
+remove_record() {
+    rm -rf "$FORGE_DB/$1"
+}
+
+# =========[ Localizar pacotes nos repositórios ]=========
+find_pkg() {
+    for repo in "${FORGE_REPOS[@]}"; do
+        [ -d "$repo/$1" ] && echo "$repo/$1" && return 0
+    done
+    return 1
+}
+# =========[ Helpers de repositório e recipe ]=========
+recipe_path() { # $1=pkg -> ecoa caminho completo da recipe
+    local pkg=$1
+    for repo in "${FORGE_REPOS[@]}"; do
+        # aceita estrutura repo/<categoria>/<pkg>
+        local hit
+        hit="$(find "$repo" -mindepth 2 -maxdepth 2 -type d -name "$pkg" 2>/dev/null | head -n1)"
+        [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+    done
+    return 1
+}
+
+read_version() { local d; d="$(recipe_path "$1")" || return 1; tr -d ' \t\r\n' < "$d/version"; }
+read_depends() { local d; d="$(recipe_path "$1")" || return 0; [[ -f "$d/depends" ]] && awk 'NF{print $1}' "$d/depends"; }
+
+# =========[ Resolução de dependências (ordem topológica) ]=========
+_res_seen=(); _res_order=()
+_res_mark_seen() { _res_seen+=("$1"); }
+_res_is_seen() { local x; for x in "${_res_seen[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+_res_push_order() { _res_order+=("$1"); }
+
+_resolve_one() {
+    local p=$1
+    _res_is_seen "$p" && return 0
+    _res_mark_seen "$p"
+    local d
+    while read -r d 2>/dev/null; do [[ -n "$d" ]] && _resolve_one "$d"; done < <(read_depends "$p")
+    _res_push_order "$p"
+}
+
 resolve_deps_order() {
-  # entrada: lista de pacotes; saída: ordem topológica única (deps antes dos pais)
-  need awk
-  _seen=""; _order=""
-  _dfs() {
-    local p="$1" d
-    case " ${_seen} " in *" $p "*) return;; esac
-    _seen="${_seen} $p"
-    for d in $(pkg_deps "$p"); do _dfs "$d"; done
-    _order="${_order} $p"
-  }
-  for x in "$@"; do _dfs "$x"; done
-  for x in $_order; do echo "$x"; done | awk '!seen[$0]++'
+    _res_seen=(); _res_order=()
+    local p
+    for p in "$@"; do _resolve_one "$p"; done
+    printf '%s\n' "${_res_order[@]}" | awk 'NF && !seen[$0]++'
 }
 
-# ========== Hooks ==========
-# hooks por pacote: pre-build, post-build, pre-install, post-install, pre-remove, post-remove
-run_hook() {
-  local pkg="$1" hook="$2" d
-  d="$(recipe_dir "$pkg")" || return 0
-  [ -x "$d/$hook" ] || return 0
-  say "hook $hook ($pkg)"
-  "$d/$hook"
+# =========[ Hooks ]=========
+run_hook() { # $1=pkg $2=hook-name
+    local pkg=$1 hook=$2 d
+    d="$(recipe_path "$pkg")" || return 0
+    [[ -x "$d/$hook" ]] || return 0
+    msg "hook $hook ($pkg)"
+    "$d/$hook"
 }
 
-# ajuda
+# =========[ Download de fontes + checksums ]=========
+download_sources() {
+    local pkg=$1 d src url out
+    d="$(recipe_path "$pkg")" || err "recipe não encontrada: $pkg"
+    [[ -f "$d/sources" ]] || return 0
+    command -v curl >/dev/null || err "curl não encontrado"
+
+    while IFS= read -r src || [[ -n "$src" ]]; do
+        [[ -z "$src" ]] && continue
+        out="$FORGE_SOURCES/${src##*/}"
+        if [[ ! -f "$out" ]]; then
+            msg "baixando $(basename "$out")"
+            curl -L --fail --retry 3 --continue-at - "$src" -o "$out" 2>&1 | tee -a "$FORGE_LOG/$pkg.log"
+        fi
+    done < "$d/sources"
+
+    # Verificação opcional por sha256
+    if [[ -f "$d/checksums" ]]; then
+        command -v sha256sum >/dev/null || err "sha256sum não encontrado"
+        paste -d' ' "$d/checksums" "$d/sources" | while read -r sum link; do
+            [[ -z "$sum" ]] && continue
+            out="$FORGE_SOURCES/${link##*/}"
+            printf '%s  %s\n' "$sum" "$out" | sha256sum -c - || err "checksum falhou: $out"
+        done
+    fi
+}
+
+# =========[ Extrair + aplicar patches ]=========
+unpack_and_patch() {
+    local pkg=$1 d w main=""
+    d="$(recipe_path "$pkg")" || err "recipe não encontrada: $pkg"
+    w="$FORGE_BUILD/$pkg"
+    rm -rf "$w"; mkdir -p "$w"
+
+    if [[ -f "$d/sources" ]]; then
+        while IFS= read -r link || [[ -n "$link" ]]; do
+            [[ -z "$link" ]] && continue
+            local f="$FORGE_SOURCES/${link##*/}"
+            case "$f" in
+                *.tar.*|*.tgz|*.tbz2|*.txz|*.tar) (cd "$w" && tar -xf "$f");;
+                *.zip) (cd "$w" && unzip -q "$f");;
+                *.patch) : ;;  # patch listado é ignorado aqui; usamos $d/patches/*.patch
+                *) cp -a "$f" "$w/";;
+            esac
+        done < "$d/sources"
+    fi
+
+    # diretório principal (primeiro dir extraído) ou o próprio $w
+    main="$(find "$w" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    [[ -z "$main" ]] && main="$w"
+
+    if [[ -d "$d/patches" ]]; then
+        command -v patch >/dev/null || err "patch não encontrado"
+        ( cd "$main"
+          for p in "$d"/patches/*.patch; do
+            [[ -f "$p" ]] || continue
+            msg "patch $(basename "$p")"
+            patch -p1 < "$p"
+          done
+        )
+    fi
+    printf '%s\n' "$main"
+}
+
+# =========[ Build ]=========
+forge_build() {
+    local pkg=$1 d ver src dest
+    d="$(recipe_path "$pkg")" || err "recipe não encontrada: $pkg"
+    ver="$(read_version "$pkg")"
+
+    # construir deps (se não instaladas)
+    while read -r dep 2>/dev/null; do
+        [[ -z "$dep" ]] && continue
+        if ! pkg_installed "$dep"; then
+            forge_build "$dep"
+            forge_install "$dep"
+        fi
+    done < <(read_depends "$pkg")
+
+    download_sources "$pkg"
+    src="$(unpack_and_patch "$pkg")"
+    dest="${FORGE_DESTDIR:-/tmp/forge-dest}/$pkg"
+    rm -rf "$dest"; mkdir -p "$dest"
+
+    export DESTDIR="$dest"
+    export MAKEFLAGS="-j${FORGE_JOBS:-1}"
+
+    run_hook "$pkg" pre-build
+    msg "build $pkg-$ver"
+    if [[ -x "$d/build" ]]; then
+        ( cd "$src"; "$d/build" ) >> "$FORGE_LOG/$pkg.log" 2>&1 || err "falha no build ($pkg). veja $FORGE_LOG/$pkg.log"
+    else
+        ( cd "$src"; sh "$d/build" ) >> "$FORGE_LOG/$pkg.log" 2>&1 || err "falha no build ($pkg). veja $FORGE_LOG/$pkg.log"
+    fi
+    run_hook "$pkg" post-build
+    ok "build concluído: $pkg-$ver"
+}
+
+# =========[ Install (com tracking de arquivos) ]=========
+forge_install() {
+    local pkg=$1 d ver dest fileslist
+    d="$(recipe_path "$pkg")" || err "recipe não encontrada: $pkg"
+    ver="$(read_version "$pkg")"
+    dest="${FORGE_DESTDIR:-/tmp/forge-dest}/$pkg"
+    [[ -d "$dest" ]] || err "nada para instalar: rode 'forge build $pkg'"
+
+    run_hook "$pkg" pre-install
+    msg "install $pkg-$ver"
+
+    # copiar usando tar (mais robusto que múltiplos cp -a)
+    ( cd "$dest" && tar -cf - . ) | ( cd / && tar -xf - )
+
+    mkdir -p "$FORGE_DB/$pkg"
+    fileslist="$FORGE_DB/$pkg/files"
+    ( cd "$dest" && find . -type f -o -type l -o -type d | sed 's#^\./#/#' | LC_ALL=C sort ) > "$fileslist"
+    echo "$ver" > "$FORGE_DB/$pkg/version"
+    read_depends "$pkg" > "$FORGE_DB/$pkg/deps" 2>/dev/null || true
+
+    run_hook "$pkg" post-install
+    ok "instalado: $pkg-$ver"
+}
+
+# =========[ Remove (usa manifesto + hooks) ]=========
+forge_remove() {
+    local pkg=$1
+    [[ -d "$FORGE_DB/$pkg" ]] || err "$pkg não está instalado"
+
+    # aviso se alguém depende dele
+    local user depby
+    depby=""
+    for user in $(ls -1 "$FORGE_DB" 2>/dev/null); do
+        [[ -f "$FORGE_DB/$user/deps" ]] && grep -qx "$pkg" "$FORGE_DB/$user/deps" && depby+="$user "
+    done
+    if [[ -n "$depby" ]]; then
+        warn "$pkg é dependência de: $depby"
+        read -r -p "remover mesmo assim? [y/N] " a
+        [[ "$a" =~ ^[Yy]$ ]] || { msg "aborto"; return 1; }
+    fi
+
+    run_hook "$pkg" pre-remove
+    msg "remove $pkg"
+
+    # remove na ordem inversa do manifesto e tenta limpar diretórios vazios
+    if [[ -f "$FORGE_DB/$pkg/files" ]]; then
+        tac "$FORGE_DB/$pkg/files" 2>/dev/null || \
+        tail -r "$FORGE_DB/$pkg/files" 2>/dev/null || \
+        awk '{a[NR]=$0} END{for(i=NR;i>0;i--)print a[i]}' "$FORGE_DB/$pkg/files" | \
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            [[ -L "$f" || -f "$f" ]] && rm -f "$f" 2>/dev/null || true
+            rmdir -p "$(dirname "$f")" 2>/dev/null || true
+        done
+    fi
+    rm -rf "$FORGE_DB/$pkg"
+    run_hook "$pkg" post-remove
+    ok "removido: $pkg"
+
+    # pergunta sobre órfãos (apenas listar aqui; modo auto fica na Parte 3)
+    local orf
+    orf="$(forge_orphans list)"
+    if [[ -n "$orf" ]]; then
+        echo "órfãos: $orf"
+        read -r -p "remover órfãos também? [y/N] " a
+        if [[ "$a" =~ ^[Yy]$ ]]; then
+            for p in $orf; do forge_remove "$p"; done
+        fi
+    fi
+}
+
+# =========[ Sync (git pull em todos repositórios locais) ]=========
+forge_sync() {
+    local repo
+    for repo in "${FORGE_REPOS[@]}"; do
+        if [[ -d "$repo/.git" ]]; then
+            msg "sync $repo"
+            ( cd "$repo" && git pull --rebase --autostash >/dev/null 2>&1 || git pull --ff-only >/dev/null 2>&1 ) \
+              || warn "falha ao sincronizar: $repo"
+        else
+            warn "não é repo git: $repo (pulando)"
+        fi
+    done
+    ok "sync concluído"
+}
+
+# =========[ World (rebuild instalado em ordem) ]=========
+forge_world() {
+    local all order p
+    all="$(ls -1 "$FORGE_DB" 2>/dev/null || true)"
+    [[ -z "$all" ]] && { msg "nada instalado"; return 0; }
+
+    # ordem topológica consolidada
+    order=()
+    for p in $all; do
+        while read -r n; do
+            [[ " ${order[*]} " == *" $n "* ]] || order+=("$n")
+        done < <(resolve_deps_order "$p")
+    done
+
+    for p in "${order[@]}"; do
+        msg "[world] $p"
+        forge_build "$p"
+        forge_install "$p"
+    done
+    ok "world concluído"
+}
+# =========[ Version compare (retorna 0 se $1 < $2) ]=========
+ver_lt() { [ "$(printf '%s\n%s' "$1" "$2" | sort -V | head -n1)" != "$2" ]; }
+
+# =========[ Upgrade ]=========
+forge_upgrade() {
+    local pkg=$1 cur new
+    cur="$(pkg_version "$pkg" 2>/dev/null || true)"
+    new="$(read_version "$pkg" 2>/dev/null || true)"
+    [[ -z "$cur" || -z "$new" ]] && { warn "pacote não encontrado: $pkg"; return; }
+    if ver_lt "$cur" "$new"; then
+        msg "upgrade $pkg $cur -> $new"
+        forge_build "$pkg"
+        forge_install "$pkg"
+    else
+        msg "$pkg já na versão mais recente ($cur)"
+    fi
+}
+
+# =========[ Orphans ]=========
+forge_orphans() {
+    local mode=${1:-list} p used
+    used=()
+    for p in $(ls -1 "$FORGE_DB" 2>/dev/null); do
+        [[ -f "$FORGE_DB/$p/deps" ]] && used+=($(cat "$FORGE_DB/$p/deps"))
+    done
+
+    local all="$(ls -1 "$FORGE_DB" 2>/dev/null)"
+    local orf=()
+    for p in $all; do
+        [[ " ${used[*]} " == *" $p "* ]] || orf+=("$p")
+    done
+
+    case "$mode" in
+        list) printf '%s\n' "${orf[@]}";;
+        auto) for p in "${orf[@]}"; do forge_remove "$p"; done;;
+        *) err "uso: forge orphans [list|auto]";;
+    esac
+}
+
+# =========[ Search, show, list ]=========
+forge_search() {
+    local term=$1 repo d
+    for repo in "${FORGE_REPOS[@]}"; do
+        while IFS= read -r d; do
+            pkg="${d##*/}"
+            grep -qi "$term" <<< "$pkg" && echo "$pkg"
+        done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d)
+    done | sort -u
+}
+
+forge_show() {
+    local pkg=$1 d ver
+    d="$(recipe_path "$pkg")" || err "recipe não encontrada: $pkg"
+    ver="$(read_version "$pkg")"
+    echo "Pacote: $pkg"
+    echo "Versão: $ver"
+    echo "Path: $d"
+    [[ -f "$d/depends" ]] && { echo "Depende de:"; cat "$d/depends"; }
+}
+
+forge_list() { ls -1 "$FORGE_DB" 2>/dev/null || true; }
+
+# =========[ Dispatcher CLI ]=========
 usage() {
 cat <<EOF
-uso: forge <comando> [args]
+Uso: forge <comando> [args]
 
-comandos:
-  sync                      - sincroniza todos os repositórios (git pull)
-  build <pkg>               - resolve deps e compila pacote (gera binário opcional)
-  install <pkg>             - instala pacote (usa DESTDIR do build)
-  remove <pkg>              - remove pacote (usa lista de arquivos)
-  show <pkg>                - exibe info de pkg (versões, deps)
-  list                      - lista instalados
-  search <padrão>           - busca por pacotes nos repositórios
-  orphans [--auto|--list]   - lista/remove pacotes órfãos
-  world                     - recompila+reinstala todo o sistema em ordem de deps
-  upgrade                   - atualiza somente se a versão do repo for maior
-  help                      - mostra esta ajuda
+Comandos principais:
+  build <pkg>      - compila pacote (e deps)
+  install <pkg>    - instala pacote já compilado
+  remove <pkg>     - remove pacote (pergunta sobre órfãos)
+  upgrade <pkg>    - atualiza se versão for maior
+  world            - recompila todos os instalados
+  sync             - sincroniza todos os repositórios git
+  search <termo>   - procura pacotes nos repositórios
+  show <pkg>       - mostra info de pacote
+  list             - lista pacotes instalados
+  orphans [list|auto] - lida com pacotes órfãos
 
-variáveis úteis:
-  FORGE_REPO_DIRS='/repo/base:/repo/x11:/repo/extra'   (lista ':'-separada)
-  FORGE_DB, FORGE_INSTALLED, FORGE_BUILD, FORGE_SOURCES, FORGE_BINPKGS, FORGE_LOGS
-  FORGE_JOBS (padrão: nproc), FORGE_COLOR=1, FORGE_QUIET=0, FORGE_SPINNER=1
-EOF
-}
-# ========== Download / integridade (checksums opcionais) ==========
-download_sources() {
-  local pkg="$1" d url f i=0
-  d="$(recipe_dir "$pkg")" || die "receita não encontrada: $pkg"
-  [ -f "$d/sources" ] || return 0
-  need curl
-  while IFS= read -r url || [ -n "$url" ]; do
-    [ -z "$url" ] && continue
-    f="${FORGE_SOURCES}/${url##*/}"
-    if [ ! -f "$f" ]; then
-      say "baixando $(basename "$f")"
-      spin_run "download $(basename "$f")" \
-        sh -c "curl -L --fail --retry 3 --continue-at - '$url' -o '$f'"
-    fi
-    i=$((i+1))
-  done < "$d/sources"
-
-  # checksums (sha256) na mesma ordem do sources (opcional)
-  if [ -f "$d/checksums" ]; then
-    need sha256sum
-    paste -d' ' "$d/checksums" "$d/sources" | while read -r sum link; do
-      [ -z "$sum" ] && continue
-      f="${FORGE_SOURCES}/${link##*/}"
-      sha256sum -c <(echo "$sum  $f") || die "checksum falhou: $f"
-    done
-  fi
-}
-
-# ========== Unpack + patches ==========
-unpack_and_patch() {
-  local pkg="$1" d w src_main=""
-  d="$(recipe_dir "$pkg")"; w="$(pkg_build_root "$pkg")"
-  rm -rf "$w"; mkdir -p "$w"
-  [ -f "$d/sources" ] || { echo "$w"; return 0; }
-
-  while IFS= read -r link || [ -n "$link" ]; do
-    [ -z "$link" ] && continue
-    f="${FORGE_SOURCES}/${link##*/}"
-    case "$f" in
-      *.tar.*|*.tgz|*.tbz2|*.txz)
-        say "extraindo $(basename "$f")"
-        (cd "$w" && tar -xf "$f")
-        [ -z "$src_main" ] && src_main="$(find "$w" -mindepth 1 -maxdepth 1 -type d | head -n1 || echo "$w")"
-        ;;
-      *.patch) : ;; # patches geralmente ficam em patches/, mas suportamos se listado
-      *) cp -a "$f" "$w/";;
-    esac
-  done < "$d/sources"
-
-  [ -z "$src_main" ] && src_main="$w"
-  # aplicar patches do diretório patches/
-  if [ -d "$d/patches" ]; then
-    need patch
-    ( cd "$src_main"
-      for p in "$d"/patches/*.patch; do
-        [ -f "$p" ] || continue
-        say "patch $(basename "$p")"
-        patch -p1 < "$p"
-      done
-    )
-  fi
-  printf '%s\n' "$src_main"
-}
-
-# ========== Build (com hooks, logs e paralelismo) ==========
-do_build_only() {
-  local pkg="$1" d v src stage log
-  d="$(recipe_dir "$pkg")" || die "receita não encontrada: $pkg"
-  v="$(pkg_version "$pkg")"
-  log="$(pkg_log "$pkg")"
-  stage="$(pkg_destdir "$pkg")"
-
-  # deps (build) — compila/instala deps se não instaladas
-  for dep in $(pkg_deps "$pkg"); do
-    [ -d "$(pkg_state_dir "$dep")" ] || { do_build_only "$dep"; do_install_only "$dep"; }
-  done
-
-  download_sources "$pkg"
-  src="$(unpack_and_patch "$pkg")"
-  rm -rf "$stage"; mkdir -p "$stage"
-
-  run_hook "$pkg" "pre-build"
-  say "build $pkg-$v"
-  MAKEFLAGS="-j${FORGE_JOBS}"
-  export MAKEFLAGS DESTDIR="$stage"
-  { 
-    set -x
-    ( cd "$src" && [ -x "$d/build" ] && "$d/build" || sh "$d/build" )
-  } >"$log" 2>&1 || { tail -n 60 "$log" >&2; die "falha no build ($pkg). veja $log"; }
-  run_hook "$pkg" "post-build"
-
-  # gerar binário opcional (tar.xz do stage)
-  local bin; bin="$(pkg_binpath "$pkg")"
-  ( cd "$stage" && tar -cJf "$bin" . ) || true
-}
-
-# ========== Install (com tracking de arquivos + hooks) ==========
-do_install_only() {
-  local pkg="$1" v stage state files log
-  v="$(pkg_version "$pkg")" || die "sem versão: $pkg"
-  stage="$(pkg_destdir "$pkg")"
-  state="$(pkg_state_dir "$pkg")"
-  files="$(pkg_files "$pkg")"
-  log="$(pkg_log "$pkg")"
-
-  [ -d "$stage" ] || die "nada para instalar; rode 'forge build $pkg'"
-
-  run_hook "$pkg" "pre-install"
-  say "install $pkg-$v"
-  mkdir -p "$state"
-  : >"$files"
-
-  # copiar preservando atributos; registrar manifesto
-  # instalando com tar para minimizar edge cases de cp -a
-  ( cd "$stage" && tar -cf - . ) | ( cd / && tar -xf - )
-  ( cd "$stage" && find . -type f -o -type l -o -type d | sed 's#^\./#/#' | LC_ALL=C sort ) > "$files"
-
-  printf '%s\n' "$v" > "$state/version"
-  # registra deps efetivas do repo no momento
-  { for d in $(pkg_deps "$pkg"); do echo "$d"; done; } > "$state/depends" 2>/dev/null || true
-
-  run_hook "$pkg" "post-install"
-  say "instalado: $pkg-$v"
-  echo "[installed $pkg-$v]" >> "$log"
-}
-
-# ========== Remove (com hooks e confirmação de órfãos) ==========
-revdeps_of() {
-  # quem depende de $1?
-  local target="$1" p
-  for p in $(ls -1 "$FORGE_INSTALLED" 2>/dev/null || true); do
-    [ -f "$(pkg_state_dir "$p")/depends" ] && grep -qx "$target" "$(pkg_state_dir "$p")/depends" && printf '%s\n' "$p" || true
-  done
-}
-
-do_remove() {
-  local pkg="$1" state files
-  state="$(pkg_state_dir "$pkg")"
-  [ -d "$state" ] || die "$pkg não está instalado"
-
-  # se alguém depende, avisa
-  local users; users="$(revdeps_of "$pkg" | tr '\n' ' ' || true)"
-  if [ -n "$users" ]; then
-    warn "$pkg é dependência de: $users"
-    printf "remover assim mesmo? [y/N] "; read ans; case "$ans" in y|Y) :;; *) say "aborto"; return 1;; esac
-  fi
-
-  run_hook "$pkg" "pre-remove"
-  files="$(pkg_files "$pkg")"
-  say "removendo $pkg"
-  if [ -f "$files" ]; then
-    # remove arquivos e tenta limpar dirs vazios
-    tac "$files" 2>/dev/null || tail -r "$files" 2>/dev/null || awk '{a[NR]=$0} END{for(i=NR;i>0;i--)print a[i]}' "$files" | \
-    while IFS= read -r f; do
-      [ -z "$f" ] && continue
-      [ -L "$f" ] || [ -f "$f" ] && rm -f "$f" 2>/dev/null || true
-      d="$(dirname "$f")"; rmdir -p "$d" 2>/dev/null || true
-    done
-  fi
-  rm -rf "$state"
-  run_hook "$pkg" "post-remove"
-  say "removido: $pkg"
-}
-
-# ========== Search / Info / Lista ==========
-do_search() {
-  local pat="$1" dir
-  while read -r dir; do
-    find "$dir" -mindepth 2 -maxdepth 2 -type d -name "*$pat*" -printf '%P\n' 2>/dev/null || true
-  done <<EOF
-$(split_colon "$FORGE_REPO_DIRS")
 EOF
 }
 
-do_info() {
-  local pkg="$1" d v iv
-  d="$(recipe_dir "$pkg")" || die "receita não encontrada: $pkg"
-  v="$(pkg_version "$pkg")"
-  iv="$(pkg_installed_ver "$pkg")"
-  printf "pacote : %s\nversão : %s\ninstal.: %s\n" "$pkg" "$v" "$( [ -n "$iv" ] && echo "$iv" || echo "não" )"
-  printf "deps   : %s\n" "$(pkg_deps "$pkg" | tr '\n' ' ' )"
-  printf "repo   : %s\n" "$d"
-}
-
-do_list_installed() { ls -1 "$FORGE_INSTALLED" 2>/dev/null | LC_ALL=C sort || true; }
-
-# ========== Órfãos (avançado) ==========
-list_orphans() {
-  # órfão = instalado que não é requerido por ninguém (e não está protegido)
-  local base="${FORGE_BASE_PACKAGES:-}" p users
-  for p in $(do_list_installed); do
-    case " $base " in *" $p "*) continue;; esac
-    users="$(revdeps_of "$p" || true)"
-    [ -z "$users" ] && echo "$p"
-  done
-}
-
-do_orphans() {
-  local mode="${1-}"
-  local list; list="$(list_orphans || true)"
-  [ -z "$list" ] && { say "sem órfãos"; return 0; }
-  case "$mode" in
-    --auto) for p in $list; do do_remove "$p"; done ;;
-    --list|"") printf '%s\n' "$list" ;;
-    *) die "uso: forge orphans [--auto|--list]";;
-  esac
-}
-
-# ========== World (rebuild ordenado) ==========
-do_world() {
-  local all order p
-  all="$(do_list_installed)"
-  [ -z "$all" ] && { say "nada instalado"; return 0; }
-  # mescla ordem topológica para todos
-  order=""
-  for p in $all; do
-    for n in $(resolve_deps_order "$p"); do
-      case " $order " in *" $n "*) :;; *) order="$order $n";; esac
-    done
-  done
-  for p in $order; do
-    say "[world] $p"
-    do_build_only "$p"
-    do_install_only "$p"
-  done
-}
-
-# ========== Upgrade (somente versões maiores) ==========
-ver_gt() {
-  # compara $1 > $2 usando sort -V (se existir), senão lexicográfico
-  if command -v sort >/dev/null 2>&1 && printf '%s\n%s\n' "$2" "$1" | sort -V | tail -n1 | grep -qx "$1"; then
-    [ "$1" != "$2" ] && return 0 || return 1
-  else
-    [ "$1" \> "$2" ] && [ "$1" != "$2" ]
-  fi
-}
-do_upgrade() {
-  local p inst repo
-  for p in $(do_list_installed); do
-    inst="$(pkg_installed_ver "$p" || true)"
-    repo="$(pkg_version "$p" || true)"
-    [ -z "$repo" ] && continue
-    if [ -z "$inst" ] || ver_gt "$repo" "$inst"; then
-      say "upgrade $p: ${inst:-none} -> $repo"
-      do_build_only "$p"
-      do_install_only "$p"
-    fi
-  done
-}
-
-# ========== Sync (git pull em todos os repositórios locais) ==========
-do_sync() {
-  local dir
-  while read -r dir; do
-    [ -d "$dir/.git" ] || { warn "não é git: $dir (pulando)"; continue; }
-    say "sync $dir"
-    ( cd "$dir" && git pull --rebase --autostash || git pull --ff-only ) >/dev/null 2>&1 || warn "falha ao sincronizar $dir"
-  done <<EOF
-$(split_colon "$FORGE_REPO_DIRS")
-EOF
-  say "sync concluído"
-}
-
-# ========== Dispatcher ==========
-main() {
-  local cmd="${1-}"; shift || true
-  case "${cmd:-}" in
-    help|-h|--help) usage ;;
-    sync)           do_sync ;;
-    build)          [ $# -eq 1 ] || die "uso: forge build <pkg>";  for x in $(resolve_deps_order "$1"); do do_build_only "$x"; done ;;
-    install)        [ $# -eq 1 ] || die "uso: forge install <pkg>";for x in $(resolve_deps_order "$1"); do do_install_only "$x"; done ;;
-    remove)         [ $# -eq 1 ] || die "uso: forge remove <pkg>"; do_remove "$1" ;;
-    show|info)      [ $# -eq 1 ] || die "uso: forge show <pkg>";   do_info "$1" ;;
-    list)           do_list_installed ;;
-    search)         [ $# -eq 1 ] || die "uso: forge search <padrão>"; do_search "$1" ;;
-    orphans)        do_orphans "${1-}";;
-    world)          do_world ;;
-    upgrade)        do_upgrade ;;
-    *)              usage; [ -n "${cmd-}" ] && die "comando desconhecido: $cmd" ;;
-  esac
-}
-main "$@"
-# ========== Órfãos (avançado) ==========
-list_orphans() {
-  # órfão = instalado que não é requerido por ninguém (e não está protegido)
-  local base="${FORGE_BASE_PACKAGES:-}" p users
-  for p in $(do_list_installed); do
-    case " $base " in *" $p "*) continue;; esac
-    users="$(revdeps_of "$p" || true)"
-    [ -z "$users" ] && echo "$p"
-  done
-}
-
-do_orphans() {
-  local mode="${1-}"
-  local list; list="$(list_orphans || true)"
-  [ -z "$list" ] && { say "sem órfãos"; return 0; }
-  case "$mode" in
-    --auto) for p in $list; do do_remove "$p"; done ;;
-    --list|"") printf '%s\n' "$list" ;;
-    *) die "uso: forge orphans [--auto|--list]";;
-  esac
-}
-
-# ========== World (rebuild ordenado) ==========
-do_world() {
-  local all order p
-  all="$(do_list_installed)"
-  [ -z "$all" ] && { say "nada instalado"; return 0; }
-  # mescla ordem topológica para todos
-  order=""
-  for p in $all; do
-    for n in $(resolve_deps_order "$p"); do
-      case " $order " in *" $n "*) :;; *) order="$order $n";; esac
-    done
-  done
-  for p in $order; do
-    say "[world] $p"
-    do_build_only "$p"
-    do_install_only "$p"
-  done
-}
-
-# ========== Upgrade (somente versões maiores) ==========
-ver_gt() {
-  # compara $1 > $2 usando sort -V (se existir), senão lexicográfico
-  if command -v sort >/dev/null 2>&1 && printf '%s\n%s\n' "$2" "$1" | sort -V | tail -n1 | grep -qx "$1"; then
-    [ "$1" != "$2" ] && return 0 || return 1
-  else
-    [ "$1" \> "$2" ] && [ "$1" != "$2" ]
-  fi
-}
-do_upgrade() {
-  local p inst repo
-  for p in $(do_list_installed); do
-    inst="$(pkg_installed_ver "$p" || true)"
-    repo="$(pkg_version "$p" || true)"
-    [ -z "$repo" ] && continue
-    if [ -z "$inst" ] || ver_gt "$repo" "$inst"; then
-      say "upgrade $p: ${inst:-none} -> $repo"
-      do_build_only "$p"
-      do_install_only "$p"
-    fi
-  done
-}
-
-# ========== Sync (git pull em todos os repositórios locais) ==========
-do_sync() {
-  local dir
-  while read -r dir; do
-    [ -d "$dir/.git" ] || { warn "não é git: $dir (pulando)"; continue; }
-    say "sync $dir"
-    ( cd "$dir" && git pull --rebase --autostash || git pull --ff-only ) >/dev/null 2>&1 || warn "falha ao sincronizar $dir"
-  done <<EOF
-$(split_colon "$FORGE_REPO_DIRS")
-EOF
-  say "sync concluído"
-}
-
-# ========== Dispatcher ==========
-main() {
-  local cmd="${1-}"; shift || true
-  case "${cmd:-}" in
-    help|-h|--help) usage ;;
-    sync)           do_sync ;;
-    build)          [ $# -eq 1 ] || die "uso: forge build <pkg>";  for x in $(resolve_deps_order "$1"); do do_build_only "$x"; done ;;
-    install)        [ $# -eq 1 ] || die "uso: forge install <pkg>";for x in $(resolve_deps_order "$1"); do do_install_only "$x"; done ;;
-    remove)         [ $# -eq 1 ] || die "uso: forge remove <pkg>"; do_remove "$1" ;;
-    show|info)      [ $# -eq 1 ] || die "uso: forge show <pkg>";   do_info "$1" ;;
-    list)           do_list_installed ;;
-    search)         [ $# -eq 1 ] || die "uso: forge search <padrão>"; do_search "$1" ;;
-    orphans)        do_orphans "${1-}";;
-    world)          do_world ;;
-    upgrade)        do_upgrade ;;
-    *)              usage; [ -n "${cmd-}" ] && die "comando desconhecido: $cmd" ;;
-  esac
-}
-main "$@" 
+case "$1" in
+    build) shift; forge_build "$@";;
+    install) shift; forge_install "$@";;
+    remove) shift; forge_remove "$@";;
+    upgrade) shift; forge_upgrade "$@";;
+    world) forge_world;;
+    sync) forge_sync;;
+    search) shift; forge_search "$@";;
+    show) shift; forge_show "$@";;
+    list) forge_list;;
+    orphans) shift; forge_orphans "$@";;
+    ""|-h|--help|help) usage;;
+    *) err "comando inválido: $1";;
+esac
