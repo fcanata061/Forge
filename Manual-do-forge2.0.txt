@@ -1,0 +1,100 @@
+Guia Completo do Forge (Source-Based, Avançado)
+
+1. Pré-requisitos
+-----------------
+Defina no seu ~/.profile:
+
+export FORGE_DB="$HOME/.forge/db"           # banco de dados de pacotes instalados
+export FORGE_LOG="$HOME/.forge/log"         # logs de build
+export FORGE_SRC="$HOME/.forge/src"         # diretório de fontes
+export FORGE_BUILD="$HOME/.forge/build"     # diretório de build temporário
+export FORGE_DESTDIR="$HOME/.forge/dest"   # diretório de instalação temporário
+export FORGE_REPOS=(                         # array de repositórios de recipes
+  "$HOME/forge-repo/base"
+  "$HOME/forge-repo/x11"
+  "$HOME/forge-repo/desktop"
+  "$HOME/forge-repo/extras"
+)
+export FORGE_JOBS=4                          # número de jobs paralelos
+export FORGE_LTO=1                           # habilitar LTO (Link Time Optimization)
+
+Em seguida:
+source ~/.profile
+
+Ferramentas obrigatórias: find, awk, sort, tee, tar, patch, curl, sha256sum, unzip
+
+2. Comandos Principais
+----------------------
+forge build <pkg>       - Compila o pacote resolvendo dependências e aplicando patches
+forge install <pkg>     - Instala o pacote compilado no DESTDIR
+forge remove <pkg>      - Remove o pacote, perguntando sobre órfãos e dependentes
+forge upgrade [pkgs...] - Atualiza apenas se a versão do recipe for maior; sem args: todos
+forge world             - Recompila e reinstala todos pacotes em ordem de dependências
+forge sync              - Sincroniza todos os repositórios git (git pull)
+forge list              - Lista pacotes instalados
+forge search <termo>    - Busca pacotes nos repositórios
+forge show <pkg>        - Mostra informações do pacote, versão, fontes e dependências
+forge history           - Mostra logs de transações de build e instalação
+forge clean-src         - Limpa diretório de fontes
+forge verify-src        - Verifica checksums de fontes
+forge orphans           - Lista pacotes órfãos (não requeridos por outros pacotes)
+
+3. Flags Globais
+----------------
+-y           - Assume 'yes' para prompts de remoção
+--no-orphans - Ignora a remoção de pacotes órfãos
+
+4. Funcionalidades Avançadas
+----------------------------
+- Dependências topológicas: resolve automaticamente a ordem de compilação dos pacotes
+- Build otimizado: suporta MAKEFLAGS com múltiplos jobs, LTO e ccache
+- Rollback automático: em falha de install/remove, restaura estado anterior
+- Logs detalhados: cada build e instalação gera histórico em FORGE_LOGS_DIR
+- Hooks por pacote: pre-build, post-build, pre-install, post-install, pre-remove, post-remove
+- Suporte a patches: diretório patches/ aplicado automaticamente no build
+- Download + checksum: baixa fontes se ausentes e verifica integridade via SHA256
+- Gestão de órfãos: detecta e sugere remoção de pacotes não mais usados
+- World upgrade: recompila todo o sistema na ordem correta de dependências
+- Sincronização de repositórios git
+- Histórico completo: mantido para auditoria ou rollback manual
+- Suporte a múltiplos repositórios e categorias
+
+5. Exemplo de Recipe
+--------------------
+repo/base/gcc/
+  build        - script executável para compilação
+  version      - versão do pacote
+  depends      - lista de dependências (opcional)
+  sources      - URLs de download das fontes
+  checksums    - SHA256 das fontes (opcional)
+  patches/     - patches aplicáveis ao build
+
+6. Uso Rápido
+-------------
+# Build e instalação de um pacote
+forge build gcc
+forge install gcc
+
+# Remover pacote e órfãos
+forge remove vim
+
+# Atualizar apenas pacotes com nova versão
+forge upgrade
+
+# Recompilar todo o sistema
+forge world
+
+# Sincronizar repositórios
+forge sync
+
+# Consultar pacotes e dependências
+forge list
+forge show gcc
+forge search editor
+
+# Limpar fontes e verificar checksums
+forge clean-src
+forge verify-src
+
+# Visualizar histórico de builds/instalações
+forge history
