@@ -1,0 +1,107 @@
+Guia Prático do Forge (Source-Based, Avançado)
+
+1. Pré-requisitos
+-----------------
+Defina no ~/.profile:
+
+export FORGE_DB="$HOME/.forge/db"
+export FORGE_LOG="$HOME/.forge/log"
+export FORGE_SRC="$HOME/.forge/src"
+export FORGE_BUILD="$HOME/.forge/build"
+export FORGE_DESTDIR="$HOME/.forge/dest"
+export FORGE_REPOS=( "$HOME/forge-repo/base" "$HOME/forge-repo/x11" "$HOME/forge-repo/desktop" )
+export FORGE_JOBS=4
+export FORGE_LTO=1
+
+source ~/.profile
+
+Ferramentas obrigatórias: find, awk, sort, tee, tar, patch, curl, sha256sum, unzip
+
+2. Comandos Essenciais
+----------------------
+# Compilar pacote
+forge build <pkg>
+
+# Instalar pacote compilado
+forge install <pkg>
+
+# Remover pacote (com aviso de órfãos)
+forge remove <pkg>
+
+# Atualizar pacotes para versão mais nova
+forge upgrade [pkgs...]
+
+# Recompilar todo o sistema
+forge world
+
+# Sincronizar repositórios git
+forge sync
+
+# Listar pacotes instalados
+forge list
+
+# Procurar pacotes
+forge search <termo>
+
+# Ver informações detalhadas de um pacote
+forge show <pkg>
+
+# Listar pacotes órfãos
+forge orphans
+
+# Limpar fontes
+forge clean-src
+
+# Verificar checksums das fontes
+forge verify-src
+
+3. Flags Úteis
+---------------
+-y           : assume 'yes' em prompts de remoção
+--no-orphans : ignora remoção de órfãos
+
+4. Funcionalidades Chave
+------------------------
+- Resolve dependências automaticamente (ordem topológica)
+- Build otimizado com múltiplos jobs, LTO e ccache
+- Rollback automático em falha de instalação ou remoção
+- Hooks: pre-build, post-build, pre-install, post-install, pre-remove, post-remove
+- Logs detalhados de cada build e instalação
+- Suporte a patches aplicados automaticamente
+- Gestão de órfãos e histórico de transações
+
+5. Exemplo de Recipe
+--------------------
+repo/base/gcc/
+  build        - script executável para compilação
+  version      - versão do pacote
+  depends      - lista de dependências (opcional)
+  sources      - URLs de download
+  checksums    - SHA256 das fontes (opcional)
+  patches/     - patches aplicáveis ao build
+
+6. Uso Diário Prático
+---------------------
+# Compilar e instalar gcc
+forge build gcc
+forge install gcc
+
+# Atualizar pacotes do sistema
+forge upgrade
+
+# Recompilar todo o sistema
+forge world
+
+# Remover pacote e conferir órfãos
+forge remove vim
+
+# Buscar e consultar pacotes
+forge search editor
+forge show vim
+
+# Limpar fontes antigas e verificar integridade
+forge clean-src
+forge verify-src
+
+# Ver histórico de builds e instalações
+forge history
